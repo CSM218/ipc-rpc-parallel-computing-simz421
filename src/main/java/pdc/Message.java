@@ -1,162 +1,292 @@
 package pdc;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
+import java.io.EOFException;
 
-/**
- * Message represents the communication unit in the CSM218 protocol.
- *
- * This implementation uses a simple JSON wire format containing the
- * required fields: magic, version, messageType, studentId, timestamp,
- * and payload. The implementation provides minimal JSON escaping suitable
- * for the autograder inputs (payloads are plain strings or base64).
- */
 public class Message {
-    public String magic;
-    public int version;
-    public String messageType;
-    public String studentId;
-    public long timestamp;
-    public String payload;
 
-    public Message() {
-    }
+    public static final byte TYPE_REGISTER = 0;
+    public static final byte TYPE_TASK = 1;
+    public static final byte TYPE_RESULT = 2;
+    public static final byte TYPE_HEARTBEAT = 3;
+    public static final byte TYPE_ACK = 4;
+    public static final byte TYPE_MATRIX_B = 5;
 
-    public Message(String messageType, String studentId, String payload) {
-        this.magic = "CSM218";
-        this.version = 1;
-        this.messageType = messageType;
-        this.studentId = studentId;
-        this.timestamp = System.currentTimeMillis();
-        this.payload = payload;
-    }
+    private static final int MAGIC_NUMBER = 0xDEADBEEF;
+    private static final byte VERSION = 1;
 
-    private static String esc(String s) {
-        if (s == null) return "";
-        StringBuilder sb = new StringBuilder();
-        for (char c : s.toCharArray()) {
-            switch (c) {
-            case '\\': sb.append("\\\\"); break;
-            case '\"': sb.append("\\\""); break;
-            case '\n': sb.append("\\n"); break;
-            case '\r': sb.append("\\r"); break;
-            case '\t': sb.append("\\t"); break;
-            default:
-                if (c < 0x20) {
-                    sb.append(String.format("\\u%04x", (int)c));
-                } else {
-                    sb.append(c);
-                }
-            }
+    private byte messageType;
+    private String studentId;
+    private String sender;
+    private int taskId;
+    private byte[] payload;
+    private long timestamp;
+
+    private static final Map<Byte, String> TYPE_TO_NAME = new HashMap<>();
+    private static final Map<String, Byte> NAME_TO_TYPE = new HashMap<>();
+
+    static {
+        TYPE_TO_NAME.put(TYPE_REGISTER, "REGISTER_WORKER");
+        TYPE_TO_NAME.put(TYPE_TASK, "RPC_REQUEST");
+        TYPE_TO_NAME.put(TYPE_RESULT, "RPC_RESPONSE");
+        TYPE_TO_NAME.put(TYPE_HEARTBEAT, "HEARTBEAT");
+        TYPE_TO_NAME.put(TYPE_ACK, "WORKER_ACK");
+        TYPE_TO_NAME.put(TYPE_MATRIX_B, "MATRIX_B");
+
+        for (Map.Entry<Byte, String> e : TYPE_TO_NAME.entrySet()) {
+            NAME_TO_TYPE.put(e.getValue(), e.getKey());
         }
-        return sb.toString();
     }
 
+    public Message(byte messageType, String studentId, String sender, int taskId, byte[] payload) {
+
+        this.messageType = messageType;
+        this.studentId = studentId != null ? studentId : System.getenv("STUDENT_ID");
+        if (this.studentId == null) this.studentId = "unknown";
+
+        this.sender = sender != null ? sender : "";
+        this.taskId = taskId;
+        this.payload = payload != null ? payload : new byte[0];
+        this.timestamp = System.currentTimeMillis();
+    }
+
+    /**
+     * Serialize this message into the JSON protocol described in ASSIGNMENT.md.
+     * Payload is Base64-encoded into the `payload` field.
+     */
     public String toJson() {
         StringBuilder sb = new StringBuilder();
+        String typeName = TYPE_TO_NAME.getOrDefault(messageType, Byte.toString(messageType));
+        String payloadStr = Base64.getEncoder().encodeToString(payload != null ? payload : new byte[0]);
+
         sb.append('{');
-        sb.append("\"magic\":\"").append(esc(magic)).append('\"');
-        sb.append(",\"version\":").append(version);
-        sb.append(",\"messageType\":\"").append(esc(messageType)).append('\"');
-        sb.append(",\"studentId\":\"").append(esc(studentId)).append('\"');
-        sb.append(",\"timestamp\":").append(timestamp);
-        sb.append(",\"payload\":\"").append(esc(payload)).append('\"');
+        sb.append("\"magic\":\"CSM218\",");
+        sb.append("\"version\":1,");
+        sb.append("\"messageType\":\"").append(escapeJson(typeName)).append('\"').append(',');
+        sb.append("\"studentId\":\"").append(escapeJson(studentId)).append('\"').append(',');
+        sb.append("\"timestamp\":").append(timestamp).append(',');
+        sb.append("\"payload\":\"").append(escapeJson(payloadStr)).append('\"');
         sb.append('}');
         return sb.toString();
     }
 
-    public static Message parse(String json) {
-        if (json == null) return null;
-        Map<String, String> m = parseFlatJson(json);
-        if (m == null) return null;
-        Message msg = new Message();
-        msg.magic = m.getOrDefault("magic", null);
-        String v = m.get("version");
-        try { msg.version = v == null ? 0 : Integer.parseInt(v); } catch (NumberFormatException e) { msg.version = 0; }
-        msg.messageType = m.getOrDefault("messageType", null);
-        msg.studentId = m.getOrDefault("studentId", null);
-        String ts = m.get("timestamp");
-        try { msg.timestamp = ts == null ? 0L : Long.parseLong(ts); } catch (NumberFormatException e) { msg.timestamp = 0L; }
-        msg.payload = m.getOrDefault("payload", null);
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
+    }
+
+    /**
+     * Parse a JSON protocol message into a Message instance.
+     * This is a small parser intended for the assignment tests and not a full JSON parser.
+     */
+    public static Message parse(String json) throws IOException {
+        if (json == null) throw new IOException("null json");
+        String compact = json.trim();
+
+        String magic = extractStringField(compact, "magic");
+        if (magic == null) throw new IOException("missing magic");
+
+        String versionStr = extractNumberField(compact, "version");
+        int version = versionStr != null ? Integer.parseInt(versionStr) : -1;
+
+        String messageTypeName = extractStringField(compact, "messageType");
+        String student = extractStringField(compact, "studentId");
+        String timestampStr = extractNumberField(compact, "timestamp");
+        long ts = timestampStr != null ? Long.parseLong(timestampStr) : System.currentTimeMillis();
+
+        String payloadB64 = extractStringField(compact, "payload");
+        byte[] payloadBytes = payloadB64 != null ? Base64.getDecoder().decode(payloadB64) : new byte[0];
+
+        byte type = NAME_TO_TYPE.getOrDefault(messageTypeName, (byte) 0);
+
+        Message m = new Message(type, student, "", -1, payloadBytes);
+        m.timestamp = ts;
+        return m;
+    }
+
+    private static String extractStringField(String s, String field) {
+        String key = "\"" + field + "\":";
+        int idx = s.indexOf(key);
+        if (idx == -1) return null;
+        int start = s.indexOf('"', idx + key.length());
+        if (start == -1) return null;
+        start++;
+        int end = s.indexOf('"', start);
+        if (end == -1) return null;
+        String raw = s.substring(start, end);
+        return raw.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+
+    private static String extractNumberField(String s, String field) {
+        String key = "\"" + field + "\":";
+        int idx = s.indexOf(key);
+        if (idx == -1) return null;
+        int start = idx + key.length();
+        // read until comma or closing brace
+        int end = start;
+        while (end < s.length() && (Character.isDigit(s.charAt(end)) || s.charAt(end) == '-')) end++;
+        if (end == start) return null;
+        return s.substring(start, end);
+    }
+
+    /**
+     * Validate basic protocol fields for this message instance.
+     */
+    public void validate() throws Exception {
+        if (studentId == null || studentId.isEmpty()) throw new Exception("studentId missing");
+        if (timestamp <= 0) throw new Exception("invalid timestamp");
+    }
+
+    public byte[] pack() {
+
+        byte[] studentIdBytes = studentId.getBytes(StandardCharsets.UTF_8);
+        byte[] senderBytes = sender.getBytes(StandardCharsets.UTF_8);
+
+        int totalSize =
+                4 + // magic
+                1 + // version
+                1 + // type
+                2 + studentIdBytes.length +
+                2 + senderBytes.length +
+                4 + // taskId
+                4 + payload.length +
+                8; // timestamp
+
+        ByteBuffer buffer = ByteBuffer.allocate(totalSize);
+        buffer.order(ByteOrder.BIG_ENDIAN);
+
+        buffer.putInt(MAGIC_NUMBER);
+        buffer.put(VERSION);
+        buffer.put(messageType);
+
+        buffer.putShort((short) studentIdBytes.length);
+        buffer.put(studentIdBytes);
+
+        buffer.putShort((short) senderBytes.length);
+        buffer.put(senderBytes);
+
+        buffer.putInt(taskId);
+        buffer.putInt(payload.length);
+        buffer.put(payload);
+        buffer.putLong(timestamp);
+
+        return buffer.array();
+    }
+
+    public static Message readFromStream(InputStream in) throws IOException {
+
+        byte[] fixedHeader = readExactly(in, 8);
+
+        ByteBuffer headerBuf = ByteBuffer.wrap(fixedHeader);
+        headerBuf.order(ByteOrder.BIG_ENDIAN);
+
+        int magic = headerBuf.getInt();
+        if (magic != MAGIC_NUMBER) {
+            throw new IOException("Invalid magic number: 0x" + Integer.toHexString(magic));
+        }
+
+        byte version = headerBuf.get();
+        if (version != VERSION) {
+            throw new IOException("Unsupported protocol version: " + version);
+        }
+
+        byte messageType = headerBuf.get();
+        short studentIdLen = headerBuf.getShort();
+
+        if (studentIdLen < 0 || studentIdLen > 4096) {
+            throw new IOException("Invalid studentId length: " + studentIdLen);
+        }
+
+        byte[] studentIdBytes = readExactly(in, studentIdLen);
+
+        short senderLen = ByteBuffer.wrap(readExactly(in, 2))
+                .order(ByteOrder.BIG_ENDIAN)
+                .getShort();
+
+        if (senderLen < 0 || senderLen > 4096) {
+            throw new IOException("Invalid sender length: " + senderLen);
+        }
+
+        byte[] senderBytes = readExactly(in, senderLen);
+
+        ByteBuffer taskBuf = ByteBuffer.wrap(readExactly(in, 8));
+        taskBuf.order(ByteOrder.BIG_ENDIAN);
+
+        int taskId = taskBuf.getInt();
+        int payloadLen = taskBuf.getInt();
+
+        if (payloadLen < 0 || payloadLen > 50_000_000) {
+            throw new IOException("Invalid payload length: " + payloadLen);
+        }
+
+        byte[] payload = readExactly(in, payloadLen);
+
+        long timestamp = ByteBuffer.wrap(readExactly(in, 8))
+                .order(ByteOrder.BIG_ENDIAN)
+                .getLong();
+
+        String studentId = new String(studentIdBytes, StandardCharsets.UTF_8);
+        String sender = new String(senderBytes, StandardCharsets.UTF_8);
+
+        Message msg = new Message(messageType, studentId, sender, taskId, payload);
+        msg.timestamp = timestamp;
+
         return msg;
     }
 
-    private static Map<String, String> parseFlatJson(String json) {
-        Map<String, String> map = new HashMap<>();
-        int i = 0;
-        int n = json.length();
-        // very small tolerant parser for flat JSON string/object of primitives
-        while (i < n && json.charAt(i) != '{') i++;
-        if (i >= n) return null;
-        i++;
-        while (i < n) {
-            // skip spaces
-            while (i < n && Character.isWhitespace(json.charAt(i))) i++;
-            if (i < n && json.charAt(i) == '}') break;
-            if (i >= n || json.charAt(i) != '"') break;
-            int keyStart = ++i;
-            while (i < n && json.charAt(i) != '"') {
-                if (json.charAt(i) == '\\') i += 2; else i++;
+    private static byte[] readExactly(InputStream in, int n) throws IOException {
+
+        if (n == 0) return new byte[0];
+
+        byte[] buffer = new byte[n];
+        int totalRead = 0;
+
+        while (totalRead < n) {
+
+            int read = in.read(buffer, totalRead, n - totalRead);
+
+            if (read == -1) {
+                throw new EOFException(
+                        "Stream ended prematurely. Expected " + n + " bytes, got " + totalRead
+                );
             }
-            if (i >= n) break;
-            String key = unesc(json.substring(keyStart, i));
-            i++; // skip quote
-            while (i < n && (json.charAt(i) == ' ' || json.charAt(i) == ':')) i++;
-            // value
-            String value = null;
-            if (i < n && json.charAt(i) == '"') {
-                int vstart = ++i;
-                while (i < n && json.charAt(i) != '"') {
-                    if (json.charAt(i) == '\\') i += 2; else i++;
-                }
-                if (i >= n) break;
-                value = unesc(json.substring(vstart, i));
-                i++;
-            } else {
-                int vstart = i;
-                while (i < n && json.charAt(i) != ',' && json.charAt(i) != '}') i++;
-                value = json.substring(vstart, i).trim();
-            }
-            map.put(key, value);
-            while (i < n && (json.charAt(i) == ' ' || json.charAt(i) == ',')) i++;
+
+            totalRead += read;
         }
-        return map;
+
+        return buffer;
     }
 
-    private static String unesc(String s) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '\\' && i + 1 < s.length()) {
-                char n = s.charAt(++i);
-                switch (n) {
-                case '\\': sb.append('\\'); break;
-                case '"': sb.append('"'); break;
-                case 'n': sb.append('\n'); break;
-                case 'r': sb.append('\r'); break;
-                case 't': sb.append('\t'); break;
-                case 'u':
-                    if (i + 4 < s.length()) {
-                        String hex = s.substring(i+1, i+5);
-                        try { int code = Integer.parseInt(hex, 16); sb.append((char)code); i += 4; } catch (NumberFormatException e) {}
-                    }
-                    break;
-                default: sb.append(n); break;
-                }
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
+    public static void writeFrame(OutputStream out, Message msg) throws IOException {
+        byte[] data = msg.pack();
+        out.write(data);
+        // DO NOT flush here — caller controls flush timing
     }
 
-    public void validate() throws Exception {
-        if (magic == null || !magic.equals("CSM218")) throw new Exception("Invalid magic");
-        if (version != 1) throw new Exception("Invalid version");
-        if (messageType == null || messageType.isEmpty()) throw new Exception("Missing messageType");
-        if (studentId == null || studentId.isEmpty()) throw new Exception("Missing studentId");
-        if (timestamp <= 0) throw new Exception("Invalid timestamp");
-        // payload may be empty but not null
-        if (payload == null) payload = "";
+    public byte getMessageType() { return messageType; }
+    public String getStudentId() { return studentId; }
+    public String getSender() { return sender; }
+    public int getTaskId() { return taskId; }
+    public byte[] getPayload() { return payload; }
+    public long getTimestamp() { return timestamp; }
+
+    @Override
+    public String toString() {
+        return "Message{" +
+                "type=" + messageType +
+                ", student=" + studentId +
+                ", sender=" + sender +
+                ", taskId=" + taskId +
+                ", payloadSize=" + payload.length +
+                ", timestamp=" + timestamp +
+                '}';
     }
 }
